@@ -1,1 +1,1 @@
-# zipfs -- FUSE filesystem in pure C that servers a ZIP archive file
+# zipfs -- FUSE filesystem in pure C that serves a ZIP archive file

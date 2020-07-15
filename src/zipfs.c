@@ -226,7 +226,7 @@ static int zipfs_read(const char *path, char *buf, size_t size, off_t offset,
         }
         zip_buf.index = index;
 
-        zip_entry_noallocread(zip, (void *)zip_buf.data, zip_buf.size);
+        assert(zip_entry_noallocread(zip, (void *)zip_buf.data, zip_buf.size) != -1);
     }
 
     if (offset >= zip_buf.size) {
@@ -310,7 +310,7 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             if (strcmp(prev_name, local_name) != 0) {
                 strcpy(prev_name, local_name);
 
-                zip_entry_open(zip, name);
+                assert(zip_entry_open(zip, name) == 0);
                 zipfs_entry_getattr(zip, &st);
                 zip_entry_close(zip);
 
@@ -345,7 +345,7 @@ static int zipfs_read_all_entry_names(char **entry_names, struct zip_t *zip) {
     int n = zip_total_entries(zip);
     debug_eprintfln("Total entries are %d", n);
     for (int i = 0; i < n && i < MAX_ZIP_ENTRIES; ++i) {
-        zip_entry_openbyindex(zip, i);
+        assert(zip_entry_openbyindex(zip, i) == 0);
         const char *name = zip_entry_name(zip);
         entry_names[i] = malloc(strlen(name));
         if (entry_names[i] == NULL) {
