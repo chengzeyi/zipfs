@@ -1,0 +1,8 @@
+/build
+/debug
+/.clangd
+/.vscode
+/.gdb_history
+/.gdbinit
+/compile_commands.json
+/tags

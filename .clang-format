@@ -1,0 +1,8 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+
+Language: Cpp
+# AlwaysBreakAfterDefinitionReturnType: All
+# AlignConsecutiveAssignments: true
+# BinPackArguments: false
+# BinPackParameters: false
