@@ -1,3 +1,5 @@
+#define FUSE_USE_VERSION 26
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -8,14 +10,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/_pthread/_pthread_mutex_t.h>
 #include <sys/stat.h>
 #include <sys/syslimits.h>
 
+#include "fuse_opt.h"
 #include "zip.h"
 
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
+#define VAL(x) #x
+#define STR(x) VAL(x)
+
+#define DEBUG_PRINT_PREFIX "[DEBUG " __FILE__ ":" STR(__LINE__) "] "
 
 #define eprintf(...) fprintf(stderr, __VA_ARGS__)
 #define eprintfln(...)                                                         \
@@ -23,8 +27,6 @@
         eprintf(__VA_ARGS__);                                                  \
         eprintf("\n");                                                         \
     } while (0)
-
-#define DEBUG_PRINT_PREFIX "[DEBUG " __FILE__ ":" STR(__LINE__) "] "
 
 #if defined DEBUG
 #define debug_eprintf(...) eprintf(DEBUG_PRINT_PREFIX __VA_ARGS__)
@@ -38,10 +40,13 @@
 #define debug_eprintfln(...)
 #endif
 
+#define DEFAULT_MIN_BUF_SIZE (4 * 1024 * 1024)
+static size_t min_buf_size = DEFAULT_MIN_BUF_SIZE;
 struct zip_buffer_t {
     int index;
     char *data;
-    size_t size;
+    size_t buf_size;
+    size_t entry_size;
 };
 
 static struct zip_buffer_t zip_buf;
@@ -52,22 +57,30 @@ static pthread_mutex_t zip_mutex;
 #define MAX_ZIP_ENTRIES 65535
 static char *zip_entry_names[MAX_ZIP_ENTRIES];
 
-static struct zipfs_options { int show_help; } zipfs_options;
+static struct zipfs_options {
+    int show_help;
+    size_t min_buf_size;
+} zipfs_options;
 
-#define zipfs_OPTION(t, p)                                                     \
+#define ZIPFS_OPTION(t, p)                                                     \
     { t, offsetof(struct zipfs_options, p), 1 }
-static const struct fuse_opt option_spec[] = {zipfs_OPTION("-h", show_help),
-                                              zipfs_OPTION("--help", show_help),
-                                              FUSE_OPT_END};
+static const struct fuse_opt option_spec[] = {
+    ZIPFS_OPTION("-h", show_help), ZIPFS_OPTION("--help", show_help),
+    ZIPFS_OPTION("--min-buf=%zu", min_buf_size), FUSE_OPT_END};
 
 inline static int starts_with(const char *pre, const char *str) {
     return strncmp(pre, str, strlen(pre)) == 0;
 }
 
 static void show_help(const char *progname) {
-    eprintf("Usage: %s [options] <zip-file> <mountpoint>\n\n", progname);
-    eprintf("File-system specific options:\n"
-            "    -h | --help         Show this help\n"
+    eprintf("usage: %s <zip-file> <mountpoint> [options]\n\n", progname);
+    eprintf("general options:\n"
+            "    -h | --help         print help\n"
+            "    -V | --version      print version\n"
+            "\n");
+    eprintf("file-system specific options:\n"
+            "    --min-buf           Minimal buffer size in bytes for reading "
+            "zip entries\n"
             "\n");
 }
 
@@ -87,11 +100,12 @@ static void zipfs_entry_getattr(struct zip_t *zip, struct stat *stbuf) {
     if (zip_entry_isdir(zip)) {
         debug_eprintfln("Entry is dir");
         stbuf->st_mode = S_IFDIR | 0755;
+        // For consistency, always set the size of a dir to 0.
     } else {
         debug_eprintfln("Entry is regular file");
         stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_size = zip_entry_size(zip);
     }
-    stbuf->st_size = zip_entry_size(zip);
     debug_eprintfln("Size of the entry is %lld",
                     (unsigned long long)stbuf->st_size);
 }
@@ -212,30 +226,58 @@ static int zipfs_read(const char *path, char *buf, size_t size, off_t offset,
         goto cleanup;
     }
 
-    if (zip_buf.data == NULL || zip_buf.index != index) {
-        debug_eprintfln("No valid buffer cache for entry index %d found",
-                        index);
-        zip_buf.size = zip_entry_size(zip);
-        debug_eprintfln("Buffer size is %zu", zip_buf.size);
-        free(zip_buf.data);
-        zip_buf.data = malloc(zip_buf.size);
+    if (zip_buf.data == NULL) {
+        debug_eprintfln("Buffer has not initialized");
+        size_t entry_size = zip_entry_size(zip);
+        debug_eprintfln("Entry size is %zu", entry_size);
+        size_t buf_size = min_buf_size > entry_size ? min_buf_size : entry_size;
+        zip_buf.data = (char *)malloc(buf_size);
         if (zip_buf.data == NULL) {
-            perror(DEBUG_PRINT_PREFIX);
+            perror("malloc()");
             ret = -errno;
             goto cleanup;
         }
+        debug_eprintfln("Buffer with size %zu allocated", buf_size);
+        zip_buf.buf_size = buf_size;
+        zip_buf.entry_size = entry_size;
         zip_buf.index = index;
-
-        assert(zip_entry_noallocread(zip, (void *)zip_buf.data, zip_buf.size) != -1);
+        // To be strict, only use entry_size instead of buf_size.
+        assert(zip_entry_noallocread(zip, (void *)zip_buf.data,
+                                     zip_buf.entry_size) != -1);
+    } else if (zip_buf.index != index) {
+        debug_eprintfln("Entry with index %d not found", index);
+        size_t entry_size = zip_entry_size(zip);
+        debug_eprintfln("Entry size is %zu", entry_size);
+        if (zip_buf.buf_size < entry_size ||
+            (zip_buf.buf_size > entry_size &&
+             zip_buf.buf_size > min_buf_size)) {
+            size_t buf_size =
+                min_buf_size > entry_size ? min_buf_size : entry_size;
+            char *new_data = (char *)realloc(zip_buf.data, buf_size);
+            if (new_data == NULL) {
+                perror("realloc()");
+                ret = -errno;
+                goto cleanup;
+            }
+            debug_eprintfln("Buffer with size %zu reallocated", buf_size);
+            zip_buf.data = new_data;
+            zip_buf.buf_size = buf_size;
+        }
+        zip_buf.entry_size = entry_size;
+        zip_buf.index = index;
+        // To be strict, only use entry_size instead of buf_size.
+        assert(zip_entry_noallocread(zip, (void *)zip_buf.data,
+                                     zip_buf.entry_size) != -1);
     }
 
-    if (offset >= zip_buf.size) {
-        debug_eprintfln("Offset %lld is out of bound for buffer size %zu",
-                        offset, zip_buf.size);
+    if (offset >= zip_buf.entry_size) {
+        debug_eprintfln("Offset %lld is out of bound for entry size %zu",
+                        offset, zip_buf.entry_size);
         ret = 0;
         goto cleanup;
     }
-    ret = offset + size > zip_buf.size ? zip_buf.size - offset : size;
+    ret =
+        offset + size > zip_buf.entry_size ? zip_buf.entry_size - offset : size;
     memcpy(buf, zip_buf.data + offset, ret);
     debug_eprintfln("%d byte(s) copied to buffer from offset %lld", ret,
                     offset);
@@ -255,9 +297,9 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     int ret = 0;
     int dir_index = -1;
     char dir_name[MAX_PATH] = "";
+    char prev_name[MAX_PATH] = "";
 
     debug_eprintfln("Invoked with path '%s'", path);
-
     pthread_mutex_lock(&zip_mutex);
 
     if (strcmp(path, "/") != 0) {
@@ -265,7 +307,8 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             if (!zip_entry_isdir(zip)) {
                 debug_eprintfln("Entry '%s' is not dir", path + 1);
                 ret = -ENOTDIR;
-                goto cleanup;
+                zip_entry_close(zip);
+                goto unlock;
             }
 
             dir_index = zip_entry_index(zip);
@@ -283,10 +326,8 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     debug_eprintfln("Dir name is resolved as '%s'", dir_name);
 
-    char prev_name[MAX_PATH] = "";
-    int n = zip_total_entries(zip);
-    debug_eprintfln("Total entries are %d", n);
-    for (int i = dir_index + 1; i < n; ++i) {
+    for (int i = dir_index + 1;
+         i < MAX_ZIP_ENTRIES && zip_entry_names[i] != NULL; ++i) {
         const char *name = zip_entry_names[i];
 
         debug_eprintfln("Current entry name is '%s'", name);
@@ -295,7 +336,7 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             if (dir_index == -1) {
                 continue;
             } else {
-                goto cleanup;
+                break;
             }
         }
 
@@ -303,7 +344,7 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         memset(&st, 0, sizeof(struct stat));
 
         const char *local_name = name + strlen(dir_name);
-        char *slashp = strchr(local_name, '/');
+        char *slashp = (char *)strchr(local_name, '/');
 
         if (slashp == NULL) {
             // The entry is a sub-file or sub-directory.
@@ -332,10 +373,7 @@ static int zipfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             *slashp = '/';
         }
     }
-    goto unlock;
 
-cleanup:
-    zip_entry_close(zip);
 unlock:
     pthread_mutex_unlock(&zip_mutex);
     return ret;
@@ -347,9 +385,9 @@ static int zipfs_read_all_entry_names(char **entry_names, struct zip_t *zip) {
     for (int i = 0; i < n && i < MAX_ZIP_ENTRIES; ++i) {
         assert(zip_entry_openbyindex(zip, i) == 0);
         const char *name = zip_entry_name(zip);
-        entry_names[i] = malloc(strlen(name));
+        entry_names[i] = (char *)malloc(strlen(name));
         if (entry_names[i] == NULL) {
-            perror(DEBUG_PRINT_PREFIX);
+            perror("malloc()");
             zip_entry_close(zip);
             return -1;
         }
@@ -381,18 +419,37 @@ int main(int argc, char **argv) {
 
     char zip_file[PATH_MAX] = {0};
 
-    if (argc < 3 || argv[argc - 2][0] == '-' || argv[argc - 1][0] == '-') {
-        show_help(argv[0]);
-        return 1;
+    if (argc >= 3) {
+        if (realpath(argv[1], zip_file) == NULL) {
+            eprintf("Resolve zip file path '%s' error", argv[1]);
+            argv[1] = "--help";
+            argv[2] = NULL;
+            argc = 2;
+        } else {
+            zip = zip_open(zip_file, 0, 'r');
+            if (zip == NULL) {
+                eprintfln("Open ZIP file '%s' error", zip_file);
+                return 1;
+            }
+
+            if (zipfs_read_all_entry_names(zip_entry_names, zip) != 0) {
+                eprintfln("Read all entry names failed");
+                return 1;
+            }
+
+            ++argv;
+            --argc;
+        }
+    } else if (argc == 2) {
+        if (argv[1][0] != '-') {
+            argv[1] = "--help";
+        }
+    } else {
+        char *new_argv[] = {argv[0], "--help", NULL};
+        argv = new_argv;
+        argc = 2;
     }
 
-    if (!realpath(argv[argc - 2], zip_file)) {
-        eprintfln("Resolve ZIP file path '%s' error", argv[argc - 2]);
-        return 1;
-    }
-    argv[argc - 2] = argv[argc - 1];
-    argv[argc - 1] = NULL;
-    --argc;
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
     if (fuse_opt_parse(&args, &zipfs_options, option_spec, NULL) == -1) {
@@ -406,19 +463,7 @@ int main(int argc, char **argv) {
     // empty string)
     if (zipfs_options.show_help) {
         show_help(argv[0]);
-        assert(fuse_opt_add_arg(&args, "--help") == 0);
-        args.argv[0][0] = '\0';
-    }
-
-    zip = zip_open(zip_file, 0, 'r');
-    if (zip == NULL) {
-        eprintfln("Open ZIP file '%s' error", zip_file);
-        return 1;
-    }
-
-    if (zipfs_read_all_entry_names(zip_entry_names, zip) != 0) {
-        debug_eprintfln("Read all entry names failed");
-        return 1;
+        assert(fuse_opt_add_arg(&args, "-ho") == 0);
     }
 
     ret = fuse_main(args.argc, args.argv, &zipfs_operations, NULL);

@@ -2,25 +2,24 @@
 CC := clang
 DBGFLAG := -g -DDEBUG
 
+CCFLAG := $(CFLAGS) -Wall
+CCOBJFLAG := $(CFLAGS) -Wall -c
+
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S), Linux)
-    # do nothing
+    FUSE_NAME = fuse3
 else ifeq ($(UNAME_S), Darwin)
-    OSXFUSE_ROOT := /usr/local
-    OSXFUSE_INCLUDE_DIR := $(OSXFUSE_ROOT)/include/osxfuse/fuse
-    OSXFUSE_LIBRARY_DIR := $(OSXFUSE_ROOT)/lib
-    LIBS_OSXFUSE := -losxfuse -L$(OSXFUSE_LIBRARY_DIR)
+    FUSE_NAME = osxfuse
 
-    CFLAGS_OSXFUSE := -I$(OSXFUSE_INCLUDE_DIR)
-    CFLAGS_OSXFUSE += -DFUSE_USE_VERSION=26
-    CFLAGS_OSXFUSE += -D_FILE_OFFSET_BITS=64
-    CFLAGS_OSXFUSE += -D_DARWIN_USE_64_BIT_INODE
+    CCOBJFLAG += -D_FILE_OFFSET_BITS=64
+    CCOBJFLAG += -D_DARWIN_USE_64_BIT_INODE
 endif
 
-# CCFLAG := $(CFLAGS) $(CFLAGS_OSXFUSE) -Wall
-# CCOBJFLAG := $(CCFLAG) $(LIBS_OSXFUSE) -c
-CCFLAG := $(CFLAGS) $(LIBS_OSXFUSE) -Wall
-CCOBJFLAG := $(CFLAGS) $(CFLAGS_OSXFUSE) -Wall -c
+FUSE_CFLAGS = $(shell pkg-config $(FUSE_NAME) --cflags)
+FUSE_LIBS = $(shell pkg-config $(FUSE_NAME) --libs)
+
+CCOBJFLAG += $(FUSE_CFLAGS)
+CCFLAG += $(FUSE_LIBS)
 
 # path marcros
 BUILD_PATH := build
@@ -29,15 +28,6 @@ DBG_PATH := debug
 
 # compile marcros
 TARGET_NAME := zipfs
-ifeq ($(OS), Windows_NT)
-    TARGET_NAME := $(addsuffix .exe, $(TARGET_NAME))
-else
-    ifeq ($(UNAME_S), Linux)
-        # do nothing
-    else ifeq ($(UNAME_S), Darwin)
-        # do nothing
-    endif
-endif
 TARGET := $(BUILD_PATH)/$(TARGET_NAME)
 TARGET_DEBUG := $(DBG_PATH)/$(TARGET_NAME)
 
@@ -60,11 +50,17 @@ $(TARGET): $(OBJ)
 $(TARGET_DEBUG): $(OBJ_DEBUG)
 	$(CC) $(CCFLAG) $(DBGFLAG) -o $@ $^
 
-$(BUILD_PATH)/%.o: $(SRC_PATH)/%.c*
+$(BUILD_PATH)/%.o: $(SRC_PATH)/%.c* $(BUILD_PATH)
 	$(CC) $(CCOBJFLAG) -o $@ $<
 
-$(DBG_PATH)/%.o: $(SRC_PATH)/%.c*
+$(DBG_PATH)/%.o: $(SRC_PATH)/%.c* $(DBG_PATH)
 	$(CC) $(CCOBJFLAG) $(DBGFLAG) -o $@ $<
+
+$(BUILD_PATH):
+	@mkdir -p $@
+
+$(DBG_PATH):
+	@mkdir -p $@
 
 # phony rules
 
@@ -78,6 +74,14 @@ all: $(TARGET)
 .PHONY: debug
 debug: $(TARGET_DEBUG)
 
+.PHONY: install
+install: $(TARGET)
+	@cp $(TARGET) /usr/local/bin/$(TARGET_NAME)
+
+.PHONY: uninstall
+uninstall:
+	@rm -f /usr/local/bin/$(TARGET_NAME)
+
 .PHONY: clean
 clean:
 	@echo CLEAN $(CLEAN_LIST)
@@ -88,10 +92,10 @@ distclean:
 	@echo DISTCLEAN $(DISTCLEAN_LIST)
 	@rm -f $(DISTCLEAN_LIST)
 
-.PHONY: run
-run: $(TARGET)
-	@./$(TARGET)
+# .PHONY: run
+# run: $(TARGET)
+# 	@./$(TARGET)
 
-.PHONY: rundebug
-rundebug: $(TARGET_DEBUG)
-	@./$(TARGET_DEBUG)
+# .PHONY: rundebug
+# rundebug: $(TARGET_DEBUG)
+# 	@./$(TARGET_DEBUG)
